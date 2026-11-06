@@ -1,0 +1,8 @@
+# dsh-subagent-policy 插件注册补丁
+# 把本插件插入 profile 的 Cordis 行栈。
+# Host 半（exports "."）：注册 /api/dsh-subagent-policy/* 路由、持久化每会话策略、
+#   并在 agent/created 时向该会话的系统提示注入强制指令、按需拦截首个非子代理工具调用。
+# 浏览器半（exports "./client"）：在输入框工具条（conversation.input.left）注入徽标 + 设置弹层。
+- insert:
+    - id: subagent-policy
+      name: 'dsh-subagent-policy'

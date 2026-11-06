@@ -1,0 +1,62 @@
+{
+  "name": "dsh-subagent-policy",
+  "version": "0.1.0",
+  "description": "DSH 子代理强制策略插件：为每个会话单独设置「必须使用子代理」及数量约束（=n / >n / >=n / <n / <=n / a-b），宿主侧向该会话每次请求注入强制指令，客户端侧在输入框工具条提供徽标与设置弹层。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./policy": {
+      "default": "./lib/policy.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.1-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "subagent",
+    "policy"
+  ],
+  "scripts": {
+    "test": "node --test test/policy.test.mjs && node scripts/smoke.mjs && node scripts/client-smoke.mjs",
+    "test:policy": "node --test test/policy.test.mjs",
+    "test:host": "node scripts/smoke.mjs",
+    "test:client": "node scripts/client-smoke.mjs"
+  },
+  "license": "MIT",
+  "author": "xthreehao",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xthreehao/dsh-subagent-policy.git"
+  },
+  "homepage": "https://github.com/xthreehao/dsh-subagent-policy#readme",
+  "bugs": {
+    "url": "https://github.com/xthreehao/dsh-subagent-policy/issues"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}
