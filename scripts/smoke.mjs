@@ -351,6 +351,26 @@ await check('tools.guard 拦截超上限的继续派发', async () => {
   assert.equal(guard({ name: 'read_file', agent: { id: SESSION } }), undefined, '普通工具不该被拦')
 })
 
+await check('回合边界：turn/start 重置本回合配额（用完还能再派）', async () => {
+  const guard = host.guards[0]
+  // 上一回合已经用掉 2 个，spec 此刻是 =1 → 本回合超上限，拦住
+  const blocked = guard({ name: 'subagent', agent: { id: SESSION } })
+  assert.equal(typeof blocked, 'string', '本回合超上限应被拦')
+  assert.ok(blocked.indexOf('本回合') >= 0, '拒绝理由应说明按回合结算')
+
+  // 用户发新消息 → turn/start
+  await host.emit('session/event', { id: SESSION }, { type: 'turn/start', data: { turn: 't2' } })
+
+  assert.equal(guard({ name: 'subagent', agent: { id: SESSION } }), undefined, '新回合应重新放行')
+  const before = agent.steered.length
+  await host.emit('agent/turn-stopping', { agent, turn: {}, signal: { aborted: false } })
+  assert.equal(agent.steered.length, before + 1, '新回合未达标应再次 steer（拦回次数已归零）')
+
+  const state = await call(host, API + '/state')
+  assert.equal(state.json.counts[SESSION], 0, '本回合计数应归零')
+  assert.equal(state.json.totals[SESSION], 2, '累计计数应保留')
+})
+
 await check('trailing：策略 off 时 section 为空（不占上下文）', async () => {
   await call(host, API + '/set', { method: 'POST', body: { sessionId: SESSION, spec: 'off' } })
   const section = agent.sections.get('subagent-policy:session')

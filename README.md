@@ -98,12 +98,25 @@ stat 轮询原地热换。
 2. **回合不许提前结束**：订阅 `agent/turn-stopping`（serial），未达标就 `agent.steer(createUserMessage(...))`。
    agent-loop 的判定是"收件箱里有新消息就继续"（`dsh-agent-loop/lib/index.js:1000-1007`），
    这是官方唯一能让回合多跑一步的通路。提醒消息 `source.form = 'notice'`，不会被渲染成真人提问。
-   单会话最多拦 `maxCorrections`（默认 3）次，防止无限续命；`signal.aborted` 时不动手。
+   每回合最多拦 `maxCorrections`（默认 3）次，防止无限续命；`signal.aborted` 时不动手。
 3. **硬门**：`ctx.tools.guard()`（单调，返回字符串即拒绝）。默认只拦"已经超上限还要再派"；
    打开 `toolGate: true` 后，未达标时连普通工具也拦，逼模型先派子代理。
 
 计数用 `agent.ctx.on('subagent/start')` 的 `info.id`（子会话 id，天然去重）。**必须在 agent scope 上订阅**：
 事件 payload 没有 parent 字段，父会话归属完全靠 scoped dispatch。
+
+### 配额按「回合」结算（v0.1.1 修的重要语义）
+
+`=2` 的正确含义是「**本回合**派 2 个」，不是「这辈子一共派 2 个」。v0.1.0 把计数做成了整会话累计，后果是双向的：
+
+- 配额一旦用满，`tools.guard` 在该会话里就**永远**拒绝新的委派 → 表现为「子代理用完就再也开不出来」；
+- 同时后续回合 `progress().met === true`，`agent/turn-stopping` 直接 return → 强制彻底失效。
+
+现在每收到一次 `session/event` 的 `turn/start`（= 用户发了一条新消息）就清空本回合计数与拦回次数，
+累计数只留在 `/state` 的 `totals` 里给面板看。另有跨回合硬上限 `maxCorrections × 4`，
+即使 `turn/start` 事件因为别的原因没到，也不会无限续命。
+
+`/state` 因此有两组数：`counts`（本回合，判定用）与 `totals`（本会话累计，展示用）。
 
 ### 明确做不到
 
