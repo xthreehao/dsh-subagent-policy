@@ -132,8 +132,12 @@ function createHost(options = {}) {
       return results
     },
     listenerCount: (event) => (listeners.get(event) ?? []).length,
-    /** 造一个假 agent（含它自己的 agent.ctx 与独立的 section 表）。 */
-    makeAgent(id) {
+    /**
+     * 造一个假 agent（含它自己的 agent.ctx 与独立的 section 表）。
+     * @param {string} id
+     * @param {{subagentDepth?: number}} [opts] 传 subagentDepth ≥1 表示这是子代理会话
+     */
+    makeAgent(id, opts = {}) {
       const steered = []
       const agentListenerMap = new Map()
       const sections = new Map()
@@ -157,10 +161,14 @@ function createHost(options = {}) {
       const agent = {
         id,
         ctx: agentCtx,
+        // 与真实宿主同形：顶层 agent 没有 subagentDepth，子代理有
+        options: opts.subagentDepth === undefined ? {} : { subagentDepth: opts.subagentDepth },
+        session: { id, header: {} },
         sections,
         steer: (message) => { steered.push(message) },
         steered,
         /** 在 agent scope 上派发事件（模拟 scoped dispatch）。 */
+        listenerCount: (event) => (agentListenerMap.get(event) ?? []).length,
         async emit(event, ...args) {
           const bucket = (agentListenerMap.get(event) ?? []).slice()
           const results = []
@@ -252,11 +260,11 @@ await check('注册三条 REST 路由', () => {
 
 await check('重复 apply 幂等（不重复注册路由/监听器）', () => {
   const guardBefore = host.guards.length
-  const listenerBefore = host.listenerCount('agent/turn-stopping')
+  const listenerBefore = host.listenerCount('session/event')
   plugin.apply(host.ctx, {})
   assert.equal(host.routes.size, 3, '路由数不该变')
   assert.equal(host.guards.length, guardBefore, 'guard 不该重复注册')
-  assert.equal(host.listenerCount('agent/turn-stopping'), listenerBefore, '监听器不该重复注册')
+  assert.equal(host.listenerCount('session/event'), listenerBefore, '监听器不该重复注册')
 })
 
 const SESSION = 'smoke-session-1'
@@ -303,7 +311,7 @@ await check('section text 随策略求值（≥2 且已用 0 个 → 有内容�
 })
 
 await check('turn-stopping 未达标 → steer 一次，且是 notice', async () => {
-  await host.emit('agent/turn-stopping', { agent, turn: {}, signal: { aborted: false } })
+  await agent.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
   assert.equal(agent.steered.length, 1, 'steer 次数')
   const message = agent.steered[0]
   assert.equal(message.role, 'user')
@@ -312,12 +320,23 @@ await check('turn-stopping 未达标 → steer 一次，且是 notice', async ()
   assert.equal(message.content[0].type, 'text')
 })
 
+await check('回归：turn-stopping 监听器挂在 agent scope（payload 无 agent 字段）', async () => {
+  // 真载荷只有 { turn, signal }（dsh-agent-loop/lib/index.js:1001-1004）。
+  // 曾经在根 ctx 上解构 `{ agent }` → agent 永远 undefined → 完全不拦。
+  assert.equal(agent.listenerCount('agent/turn-stopping'), 1, 'agent scope 上应有且只有一个监听器')
+  assert.equal(host.listenerCount('agent/turn-stopping'), 0, '根 ctx 不该再挂一个永远空转的监听器')
+  // 旧写法（带 agent 字段的根派发）不该额外生效
+  const before = agent.steered.length
+  await host.emit('agent/turn-stopping', { agent, turn: {}, signal: { aborted: false } })
+  assert.equal(agent.steered.length, before, '根派发不该再触发 steer')
+})
+
 await check('subagent/start 计数去重，达标后不再 steer', async () => {
   await agent.emit('subagent/start', { id: 'child-a' })
   await agent.emit('subagent/start', { id: 'child-a' })
   await agent.emit('subagent/start', { id: 'child-b' })
   const before = agent.steered.length
-  await host.emit('agent/turn-stopping', { agent, turn: {}, signal: { aborted: false } })
+  await agent.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
   assert.equal(agent.steered.length, before, '达标后不该再 steer')
 })
 
@@ -337,7 +356,7 @@ await check('maxCorrections 生效：未达标最多拦 2 次后放行', async (
   await host.emit('agent/created', { agent: other })
   await call(host, API + '/set', { method: 'POST', body: { sessionId: 'smoke-session-2', spec: 'any' } })
   for (let i = 0; i < 5; i++) {
-    await host.emit('agent/turn-stopping', { agent: other, turn: {}, signal: { aborted: false } })
+    await other.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
   }
   assert.equal(other.steered.length, 2, 'steer 次数应等于 maxCorrections')
 })
@@ -358,12 +377,12 @@ await check('回合边界：turn/start 重置本回合配额（用完还能再�
   assert.equal(typeof blocked, 'string', '本回合超上限应被拦')
   assert.ok(blocked.indexOf('本回合') >= 0, '拒绝理由应说明按回合结算')
 
-  // 用户发新消息 → turn/start
-  await host.emit('session/event', { id: SESSION }, { type: 'turn/start', data: { turn: 't2' } })
+  // 用户发新消息 → turn/start（真实路径：派发在 agent scope 上）
+  await agent.emit('session/event', { id: SESSION }, { type: 'turn/start', data: { turn: 't2' } })
 
   assert.equal(guard({ name: 'subagent', agent: { id: SESSION } }), undefined, '新回合应重新放行')
   const before = agent.steered.length
-  await host.emit('agent/turn-stopping', { agent, turn: {}, signal: { aborted: false } })
+  await agent.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
   assert.equal(agent.steered.length, before + 1, '新回合未达标应再次 steer（拦回次数已归零）')
 
   const state = await call(host, API + '/state')
@@ -375,6 +394,27 @@ await check('trailing：策略 off 时 section 为空（不占上下文）', asy
   await call(host, API + '/set', { method: 'POST', body: { sessionId: SESSION, spec: 'off' } })
   const section = agent.sections.get('subagent-policy:session')
   assert.equal(section.text(), '')
+})
+
+await check('子代理会话不被强制（否则会自乘出子代理树）', async () => {
+  await call(host, API + '/set', { method: 'POST', body: { sessionId: SESSION, spec: 'any' } })
+
+  // 子代理会话：delegationDepth ≥ 1
+  const child = host.makeAgent('child-session-1', { subagentDepth: 1 })
+  await host.emit('agent/created', { agent: child })
+
+  assert.equal(child.sections.get('subagent-policy:session'), undefined, '子代理会话不该注入策略 section')
+  await child.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(child.steered.length, 0, '子代理会话不该被拦回')
+
+  const guard = host.guards[0]
+  assert.equal(
+    guard({ name: 'subagent', agent: child }),
+    undefined,
+    '子代理会话不该被数量上限拦住（它自己的子代理是合法递归，由 maxDepth 管）',
+  )
+  // 顶层会话仍被强制（=any 已达标 → 放行；用超上限场景验证它确实在被管）
+  assert.equal(guard({ name: 'subagent', agent: { id: SESSION, options: {}, session: { id: SESSION, header: {} } } }), undefined)
 })
 
 await check('无 webServer 的 profile：延迟装载后仍挂上管理面路由', () => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-policy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 子代理强制策略插件：为每个会话单独设置「必须使用子代理」及数量约束（=n / >n / >=n / <n / <=n / a-b），宿主侧向该会话每次请求注入强制指令，客户端侧在输入框工具条提供徽标与设置弹层。",
   "type": "module",
   "main": "lib/index.js",

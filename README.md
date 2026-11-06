@@ -118,6 +118,17 @@ stat 轮询原地热换。
 
 `/state` 因此有两组数：`counts`（本回合，判定用）与 `totals`（本会话累计，展示用）。
 
+### 只作用于顶层会话（v0.1.2 修的重要边界）
+
+策略**只对用户直接对话的会话生效**，对子代理会话不生效（只计数、不注入指令、不拦回）。
+
+原因很实际：`defaultSpec` 会对每个 session 生效，如果子代理会话也被要求「必须派子代理」，子代理就会去派孙代理，
+一次简单提问就能自乘出一棵子代理树（实测：一个问题跑了 3 分钟、几十个会话、每个会话拦回 3 次）。
+
+判定口径与官方 `delegationDepthOf` 一致：`max(session.header.delegationDepth, options.subagentDepth) > 0` 即为子代理会话
+（`dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js:111-115`），另用 `subagent/start` 报过的 id 兜底。
+想让子代理也被强制，显式开 `applyToSubagents: true`——**强烈不建议**，递归深度只能靠 `dsh-subagent` 的 `maxDepth` 兜。
+
 ### 明确做不到
 
 - 没有 finish/stop 校验钩子，无法在"模型给出最终答复"那一刻否决它——只能把回合续一步；
@@ -137,6 +148,7 @@ stat 轮询原地热换。
         defaultSpec: 'off'          # 没单独设置的会话用这个策略
         maxCorrections: 3           # 单回合最多拦回几次
         toolGate: false             # true = 未达标时连普通工具也拒
+        applyToSubagents: false     # true = 子代理会话也被强制（默认关，否则会自乘成树）
         delegationTools:            # 算作"一次委派"的工具名（部署分层会换名）
           - subagent
           - subagent_fork
@@ -183,6 +195,7 @@ New-Item -ItemType Junction "$p\node_modules\dsh-subagent-policy" -Target 'F:\co
 | 提示词实际内容 | `directives['e2e-demo-session'].text` 与该会话 section 用的是**同一个函数**，内容为"必须使用子代理…不少于 2 个…已使用 0 次…还差 2 次" |
 | 重启后仍在 | 重启实例后 `GET /state` 仍返回 `bySession['e2e-demo-session'] = '>=2'`（状态文件持久化），启动日志无 `entry did not activate` |
 | 本机污染 | `~/.dsh` 下没有 `dsh-subagent-policy.json`；真实实例进程未重启 |
+| 真实回合（headless，`defaultSpec: '=2'`） | 一句「用子代理并行计算 12*13 和 27+58」，模型派了 2 个子代理并汇总（156 / 85）；debug 轨迹 `turn-stopping spec==2 have=2 corrections=0`（达标，未拦回），两个子代理会话日志均为 `attach skip-enforcement depth=1`（不再自乘） |
 
 安全面：管理路由自带回环 + Host + Origin + `sec-fetch-site` 四件套校验（照抄 `dsh-hidden-session`），
 `sessionId` 走 `/^[A-Za-z0-9._-]{1,128}$/`，请求体上限 64 KB，状态文件 `0600` 原子写。
