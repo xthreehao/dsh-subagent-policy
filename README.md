@@ -105,18 +105,33 @@ stat 轮询原地热换。
 计数用 `agent.ctx.on('subagent/start')` 的 `info.id`（子会话 id，天然去重）。**必须在 agent scope 上订阅**：
 事件 payload 没有 parent 字段，父会话归属完全靠 scoped dispatch。
 
-### 配额按「回合」结算（v0.1.1 修的重要语义）
+### 两套计数：达标配额 vs 限流窗口（v0.2.1 修的语义）
 
-`=2` 的正确含义是「**本回合**派 2 个」，不是「这辈子一共派 2 个」。v0.1.0 把计数做成了整会话累计，后果是双向的：
+v0.2.0 把「配额」整个做成 5 秒滑动窗口，结果是**明明派够了、5 秒一过又重新逼**，模型被拖成
+每 5~7 秒派两个子代理的永动机（模型自己在 reasoning 里都说 "the window keeps resetting"）。
+v0.2.1 拆成两套，各管一件事：
 
-- 配额一旦用满，`tools.guard` 在该会话里就**永远**拒绝新的委派 → 表现为「子代理用完就再也开不出来」；
-- 同时后续回合 `progress().met === true`，`agent/turn-stopping` 直接 return → 强制彻底失效。
+| 计数 | 范围 | 用途 | 何时清零 |
+|---|---|---|---|
+| `used`（**达标口径**） | 本条用户消息内派出的子代理 | 决定 `turn-stopping` 是否拦回、徽标显示几 | 用户发下一条**真消息**（`source.kind === 'user'`） |
+| `counts`（限流口径） | 最近 `settleSeconds`（默认 5 秒）内派出 | `tools.guard` 拒绝超额继续派发 | 滑出窗口自动清 |
+| `totals` | 本会话累计 | 面板/排障 | 永不清 |
 
-现在每收到一次 `session/event` 的 `turn/start`（= 用户发了一条新消息）就清空本回合计数与拦回次数，
-累计数只留在 `/state` 的 `totals` 里给面板看。另有跨回合硬上限 `maxCorrections × 4`，
-即使 `turn/start` 事件因为别的原因没到，也不会无限续命。
+- **派够就停**：`used` 达到约束后 `metInTurn` 置位，之后 `turn-stopping` 一律直接放行——
+  窗口怎么结算都不会再逼，直到用户发下一条消息。
+- **徽标不再显示 0**：徽标读 `used`（`/state.used`），所以「派了 2 个」就稳定显示 2，不会 5 秒后归零。
 
-`/state` 因此有两组数：`counts`（本回合，判定用）与 `totals`（本会话累计，展示用）。
+> ⚠️ 两个死循环坑，都已修：
+> 1. **不能用 `turn/start` 当"用户发消息"信号**：agent-loop 的 `turn()` 每个 drive 循环都 append 一次
+>    （`dsh-agent-loop/lib/index.js:938-949`），我们 steer 出来的续跑也会触发 → 每轮重新武装。
+> 2. **不能把所有 `user/message` 都当用户输入**：会话里还有 `runtime-context`(snapshot)、
+>    `skill-catalog`(catalog)、`agent-message`(relay，子代理回报)、`subagent-settled`(notice)、
+>    `subagent-policy`(notice，我们自己的)。子代理一回报就复位 = 每派一轮重新逼一轮。
+>    判据必须收窄到 `source.kind === 'user'`，再加一层「自己 steer 出去的消息 id」黑名单兜底。
+
+`/state` 因此有四组数：`used`（本条消息内，达标口径，徽标用）、`counts`（当前限流窗口内）、
+`totals`（本会话累计）、`settleIn`（距离本窗口结算还剩多少毫秒）。另有硬上限 `maxCorrections × 4` 兜底，
+窗口异常不推进也不会无限续命。
 
 ### 只作用于顶层会话（v0.1.2 修的重要边界）
 
@@ -146,7 +161,8 @@ stat 轮询原地热换。
       name: dsh-subagent-policy
       config:
         defaultSpec: 'off'          # 没单独设置的会话用这个策略
-        maxCorrections: 3           # 单回合最多拦回几次
+        maxCorrections: 3           # 单条消息最多拦回几次（派够就停，不会无限续命）
+        settleSeconds: 5            # 并发限流窗口（秒）：同一个 5 秒窗口内不许超上限派发
         toolGate: false             # true = 未达标时连普通工具也拒
         applyToSubagents: false     # true = 子代理会话也被强制（默认关，否则会自乘成树）
         delegationTools:            # 算作"一次委派"的工具名（部署分层会换名）
@@ -189,13 +205,14 @@ New-Item -ItemType Junction "$p\node_modules\dsh-subagent-policy" -Target 'F:\co
 
 | 项目 | 结果 |
 | --- | --- |
-| 宿主半装载 | `GET /api/dsh-subagent-policy/state` → 200，返回 `defaultSpec/maxCorrections/delegationTools/bySession/counts/directives` |
+| 宿主半装载 | `GET /api/dsh-subagent-policy/state` → 200，返回 `defaultSpec/maxCorrections/delegationTools/bySession/counts/used/totals/settleIn/directives` |
 | 浏览器半装载 | 页面 HTML 的插件 bundle 清单里出现 `dsh-subagent-policy/client.js`，取回合并 bundle（1.93 MB）含 `subagent-policy.control` / `conversation.input.left` |
 | 写入与持久化 | `POST /set {sessionId:'e2e-demo-session', spec:'>=2'}` → 200；落盘到 `<DSH_HOME>/storages/dsh-subagent-policy.json` |
-| 提示词实际内容 | `directives['e2e-demo-session'].text` 与该会话 section 用的是**同一个函数**，内容为"必须使用子代理…不少于 2 个…已使用 0 次…还差 2 次" |
+| 提示词实际内容 | `directives['e2e-demo-session'].text` 与该会话 section 用的是**同一个函数**，内容为"必须使用子代理…恰好 2 个…本条消息已使用：0 次（派够即停，不会再重复逼；并发限流窗口每 5 秒）…" |
 | 重启后仍在 | 重启实例后 `GET /state` 仍返回 `bySession['e2e-demo-session'] = '>=2'`（状态文件持久化），启动日志无 `entry did not activate` |
 | 本机污染 | `~/.dsh` 下没有 `dsh-subagent-policy.json`；真实实例进程未重启 |
-| 真实回合（headless，`defaultSpec: '=2'`） | 一句「用子代理并行计算 12*13 和 27+58」，模型派了 2 个子代理并汇总（156 / 85）；debug 轨迹 `turn-stopping spec==2 have=2 corrections=0`（达标，未拦回），两个子代理会话日志均为 `attach skip-enforcement depth=1`（不再自乘） |
+| 真实回合（headless，`defaultSpec: '=2'`） | **收敛验证（v0.2.1）**：一句「回答：2+2=？只输出数字。」，16 秒结束，模型派 2 个子代理后直接答 `4`；debug 轨迹只有两条 `turn-stopping … used=2 window=0 corrections=0`（`used=2` 达标、`corrections=0` 说明一次都没拦），无 `steered` 行 → **不再出现 v0.2.0 那种每 5 秒重逼的永动机**。两个子代理会话均为 `attach skip-enforcement depth=1`（不自乘） |
+| 早前回合（headless，12*13 / 27+58） | 模型派了 2 个子代理并汇总（156 / 85）；`turn-stopping spec==2 have=2`（达标，未拦回） |
 
 安全面：管理路由自带回环 + Host + Origin + `sec-fetch-site` 四件套校验（照抄 `dsh-hidden-session`），
 `sessionId` 走 `/^[A-Za-z0-9._-]{1,128}$/`，请求体上限 64 KB，状态文件 `0600` 原子写。

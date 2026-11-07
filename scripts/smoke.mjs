@@ -370,24 +370,39 @@ await check('tools.guard 拦截超上限的继续派发', async () => {
   assert.equal(guard({ name: 'read_file', agent: { id: SESSION } }), undefined, '普通工具不该被拦')
 })
 
-await check('回合边界：turn/start 重置本回合配额（用完还能再派）', async () => {
+await check('用户发新消息（user/message）会立刻清窗口与拦回次数', async () => {
   const guard = host.guards[0]
-  // 上一回合已经用掉 2 个，spec 此刻是 =1 → 本回合超上限，拦住
+  // 上一轮已经用掉 2 个，spec 此刻是 =1 → 窗口内超上限，拦住
   const blocked = guard({ name: 'subagent', agent: { id: SESSION } })
-  assert.equal(typeof blocked, 'string', '本回合超上限应被拦')
-  assert.ok(blocked.indexOf('本回合') >= 0, '拒绝理由应说明按回合结算')
+  assert.equal(typeof blocked, 'string', '窗口内超上限应被拦')
+  assert.ok(blocked.indexOf('结算窗口') >= 0, '拒绝理由应说明按结算窗口算')
 
-  // 用户发新消息 → turn/start（真实路径：派发在 agent scope 上）
-  await agent.emit('session/event', { id: SESSION }, { type: 'turn/start', data: { turn: 't2' } })
+  // 用户发新消息 → session/event {type:'user/message'}（真实路径：派发在 agent scope 上）
+  await agent.emit('session/event', { id: SESSION }, { type: 'user/message', data: { message: {}, source: { kind: 'user' } } })
 
-  assert.equal(guard({ name: 'subagent', agent: { id: SESSION } }), undefined, '新回合应重新放行')
+  assert.equal(guard({ name: 'subagent', agent: { id: SESSION } }), undefined, '新请求应重新放行')
   const before = agent.steered.length
   await agent.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
-  assert.equal(agent.steered.length, before + 1, '新回合未达标应再次 steer（拦回次数已归零）')
+  assert.equal(agent.steered.length, before + 1, '新请求未达标应再次 steer（拦回次数已归零）')
 
   const state = await call(host, API + '/state')
-  assert.equal(state.json.counts[SESSION], 0, '本回合计数应归零')
+  assert.equal(state.json.counts[SESSION], 0, '窗口计数应归零')
   assert.equal(state.json.totals[SESSION], 2, '累计计数应保留')
+})
+
+await check('turn/start 是每 step 都会触发的，不能当用户消息信号', async () => {
+  const before = agent.steered.length
+  // 先把这一轮"用满"：=1 且已派 2 个
+  await agent.emit('subagent/start', { id: 'again-1' })
+  await agent.emit('subagent/start', { id: 'again-2' })
+  // 模拟 agent-loop 每个 drive 循环都发的 turn/start
+  await agent.emit('session/event', { id: SESSION }, { type: 'turn/start', data: { turn: 3 } })
+  // 若 turn/start 被当作用户消息，窗口会被清空 → counts 归零；正解是保持不变
+  const state = await call(host, API + '/state')
+  assert.equal(state.json.counts[SESSION], 2, 'turn/start 不该清窗口')
+  assert.equal(agent.steered.length, before, 'turn/start 不该引发新的拦回')
+  // 收尾：清掉策略，避免影响后续用例
+  await call(host, API + '/set', { method: 'POST', body: { sessionId: SESSION, spec: 'off' } })
 })
 
 await check('trailing：策略 off 时 section 为空（不占上下文）', async () => {
@@ -415,6 +430,114 @@ await check('子代理会话不被强制（否则会自乘出子代理树）', a
   )
   // 顶层会话仍被强制（=any 已达标 → 放行；用超上限场景验证它确实在被管）
   assert.equal(guard({ name: 'subagent', agent: { id: SESSION, options: {}, session: { id: SESSION, header: {} } } }), undefined)
+})
+
+await check('结算窗口：每 5 秒结算一次（过期自动清零、可再次派发）', async () => {
+  const w = createHost()
+  let fakeNow = 1_000_000
+  plugin.apply(w.ctx, { settleSeconds: 5, maxCorrections: 2, clock: () => fakeNow })
+  const a = w.makeAgent('win-session')
+  await w.emit('agent/created', { agent: a })
+  await call(w, API + '/set', { method: 'POST', body: { sessionId: 'win-session', spec: '=1' } })
+
+  // 同一时刻派出 2 个 → 超过 =1 的上限
+  await a.emit('subagent/start', { id: 'child-1' })
+  await a.emit('subagent/start', { id: 'child-2' })
+
+  const s1 = await call(w, API + '/state')
+  assert.equal(s1.json.settleSeconds, 5, '/state 应报告结算窗口秒数')
+  assert.equal(s1.json.counts['win-session'], 2, '窗口内应计 2')
+  assert.ok(s1.json.settleIn['win-session'] > 0, 'settleIn 应给出距结算的剩余毫秒')
+  assert.equal(typeof w.guards[0]({ name: 'subagent', agent: a }), 'string', '窗口内超上限应被拦')
+
+  // 4.9 秒：还在同一个结算窗口内
+  fakeNow += 4900
+  assert.equal((await call(w, API + '/state')).json.counts['win-session'], 2, '未到 5 秒不应结算')
+  assert.equal(typeof w.guards[0]({ name: 'subagent', agent: a }), 'string', '未到点仍然拦住')
+
+  // 5.1 秒：结算，配额自动恢复
+  fakeNow += 200
+  assert.equal((await call(w, API + '/state')).json.counts['win-session'], 0, '过窗口应清零')
+  // 徽标口径（used）不随窗口清零：否则用户会看到「明明派了 2 个，徽标却显示 0」
+  assert.equal((await call(w, API + '/state')).json.used['win-session'], 2, '本条消息的已用数不该被窗口结算清掉')
+  assert.equal(w.guards[0]({ name: 'subagent', agent: a }), undefined, '结算后应重新允许派发')
+  assert.equal((await call(w, API + '/state')).json.totals['win-session'], 2, '累计数不清零')
+})
+
+await check('窗口结算不会把「已达标」的回合重新逼一遍', async () => {
+  const w = createHost()
+  let fakeNow = 2_000_000
+  plugin.apply(w.ctx, { settleSeconds: 5, clock: () => fakeNow })
+  const a = w.makeAgent('met-session')
+  await w.emit('agent/created', { agent: a })
+  await call(w, API + '/set', { method: 'POST', body: { sessionId: 'met-session', spec: '=2' } })
+
+  await a.emit('subagent/start', { id: 'c1' })
+  await a.emit('subagent/start', { id: 'c2' })
+  fakeNow += 6000 // 5 秒窗口结算 → 计数归零
+  assert.equal((await call(w, API + '/state')).json.counts['met-session'], 0, '窗口应已结算')
+
+  const before = a.steered.length
+  await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(a.steered.length, before, '本回合已达标过，结算后不该再拦（否则每 5 秒又逼一轮）')
+
+  await a.emit('session/event', { id: 'met-session' }, { type: 'user/message', data: { message: {}, source: { kind: 'user' } } })
+  await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(a.steered.length, before + 1, '新请求（用户新消息）应重新强制')
+})
+
+await check('回归：自己 steer 的消息不能被当成用户输入（否则 5 秒窗口死循环）', async () => {
+  const w = createHost()
+  let fakeNow = 3_000_000
+  plugin.apply(w.ctx, { settleSeconds: 5, clock: () => fakeNow })
+  const a = w.makeAgent('own-msg-session')
+  await w.emit('agent/created', { agent: a })
+  await call(w, API + '/set', { method: 'POST', body: { sessionId: 'own-msg-session', spec: '=1' } })
+
+  // 先达标，再让窗口结算归零（真实轨迹里就是这一步之后被无限重逼）
+  await a.emit('subagent/start', { id: 'own-c1' })
+  await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(a.steered.length, 0, '已达标不该 steer')
+  fakeNow += 6000
+  assert.equal((await call(w, API + '/state')).json.counts['own-msg-session'], 0, '窗口应已结算')
+
+  const justBefore = a.steered.length
+  await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(a.steered.length, justBefore, '结算后不该重逼（已达标过）')
+
+  // 子代理回报（agent-message/relay）与运行时快照都不是「用户新请求」，不能复位
+  await a.emit('session/event', { id: 'own-msg-session' }, { type: 'user/message', data: { id: 'relay-1', source: { kind: 'agent-message', form: 'relay' } } })
+  await a.emit('session/event', { id: 'own-msg-session' }, { type: 'user/message', data: { id: 'ctx-1', source: { kind: 'runtime-context', form: 'snapshot' } } })
+  assert.equal((await call(w, API + '/state')).json.counts['own-msg-session'], 0, '窗口已被结算，不该被这些事件改动')
+  await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(a.steered.length, justBefore, '子代理回报/运行时快照不该复位「已达标」')
+
+  // 造一条"我们自己注入的提醒"，看它被 append 成 user/message 后会不会被误判
+  const forced = w.makeAgent('own-msg-session-2')
+  await w.emit('agent/created', { agent: forced })
+  await call(w, API + '/set', { method: 'POST', body: { sessionId: 'own-msg-session-2', spec: '=1' } })
+  await forced.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(forced.steered.length, 1, '未达标应 steer 一次')
+  const own = forced.steered[0]
+  assert.equal(typeof own.id, 'string', 'steer 出去的消息应带 id（重放判据用）')
+
+  // ① 原样重放（agent-loop 就是这么把它 append 成 user/message 的）
+  // ② 只有 source.kind、没有 id ③ 只有 form:'notice'
+  // 每轮「先重放自己的提醒，再 turn-stopping」：若真的被当成用户消息，拦回次数会被清零，
+  // 于是永远拦不完；正确实现应该在第 3 次（maxCorrections）之后停下。
+  for (let i = 0; i < 6; i += 1) {
+    await forced.emit('session/event', { id: 'own-msg-session-2' }, { type: 'user/message', data: own })
+    await forced.emit('session/event', { id: 'own-msg-session-2' }, { type: 'user/message', data: { source: { kind: 'subagent-policy' } } })
+    await forced.emit('session/event', { id: 'own-msg-session-2' }, { type: 'user/message', data: { source: { form: 'notice' } } })
+    await forced.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  }
+  assert.equal(forced.steered.length, 3, '自己的提醒不该清拦回次数（应停在 maxCorrections=3，而不是无限拦）')
+
+  // 真用户消息仍然要能复位
+  await a.emit('session/event', { id: 'own-msg-session' }, { type: 'user/message', data: { id: 'real-user-1', source: { kind: 'user' } } })
+  const before = a.steered.length
+  await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
+  assert.equal(a.steered.length, before + 1, '真用户新消息应重新强制')
 })
 
 await check('无 webServer 的 profile：延迟装载后仍挂上管理面路由', () => {
