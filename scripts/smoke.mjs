@@ -143,6 +143,7 @@ function createHost(options = {}) {
     agents: agentList,
     routes,
     guards,
+    effects,
     systemPromptSections,
     /** 触发事件并等待所有监听器（含 async）完成。 */
     async emit(event, ...args) {
@@ -583,6 +584,31 @@ await check('归属兜底：根上下文收到 subagent/start 时按 ownership �
   const state = await call(w, API + '/state')
   assert.equal(state.json.used['owner-session'], 1, '应把子代理记到父会话头上')
   assert.equal(state.json.counts['owner-session'], 1, '窗口计数同样要记上')
+})
+
+await check('重载：卸载后再次 apply 会重新挂上管理面（回归：曾经整片 HTTP 404）', async () => {
+  const w = createHost()
+  plugin.apply(w.ctx, { defaultSpec: 'any' })
+  const before = await call(w, API + '/state')
+  assert.equal(before.status, 200, '首次装配应能访问 /state')
+  // 模拟插件条目被卸载：cordis 会把 ctx.effect 注册的东西全拆掉
+  for (const dispose of w.effects.splice(0)) {
+    try {
+      if (typeof dispose === 'function') dispose()
+    } catch {
+      /* 单个 disposer 失败不影响其他 */
+    }
+  }
+  assert.equal(w.routes.size, 0, '卸载后路由应被摘掉')
+  // 同一个 ctx 再 apply 一次（cordis 重载就是这样）
+  plugin.apply(w.ctx, { defaultSpec: 'any' })
+  const after = await call(w, API + '/state')
+  assert.equal(after.status, 200, '重装后必须重新挂上路由，否则徽标弹层全是 404')
+  assert.deepEqual([...w.routes.keys()].sort(), [
+    API + '/clear',
+    API + '/set',
+    API + '/state',
+  ])
 })
 
 await check('无 webServer 的 profile：延迟装载后仍挂上管理面路由', () => {
