@@ -23,6 +23,14 @@ Node 24，profile 走自建 `DSH_HOME` 沙箱（全程没有碰本机 `~/.dsh` �
 
 ---
 
+> **变更记录**
+>
+> - `0.3.0`：`lib/index.js`（896 行）拆成 9 个职责单一模块（见第 9 节）；修「正在跑子代理却显示 0」——
+>   晚加载会话补挂 + `subagent/start` 归属兜底，新增 `/state.agents` 与诊断文件；
+>   修非法规格的报错显示空白；`defaultSpec` 改为 config 优先（不再被旧状态文件永久覆盖）。
+> - `0.2.1`：达标口径与限流窗口分离，修掉「派够了每 5 秒又重新逼」。
+> - `0.1.2`：只对顶层会话生效，`defaultSpec` 真正生效。
+
 ## 0. 从 GitHub 装
 
 ```powershell
@@ -142,7 +150,24 @@ v0.2.1 拆成两套，各管一件事：
 
 判定口径与官方 `delegationDepthOf` 一致：`max(session.header.delegationDepth, options.subagentDepth) > 0` 即为子代理会话
 （`dsh/node_modules/@deepseek-ai/dsh-subagent/lib/index.js:111-115`），另用 `subagent/start` 报过的 id 兜底。
-想让子代理也被强制，显式开 `applyToSubagents: true`——**强烈不建议**，递归深度只能靠 `dsh-subagent` 的 `maxDepth` 兜。
+为了让子代理也被强制，显式开 `applyToSubagents: true`——**强烈不建议**，递归深度只能靠 `dsh-subagent` 的 `maxDepth` 兜。
+
+### 「徽标显示 0」的两个成因（v0.3.0 修）
+
+徽标读的是 `/state.used[sessionId]`。它显示 0，就是插件**根本没有挂到那个会话上**（`used[sessionId]` 不存在），
+而不是计数逻辑算错。两种情形都会漏挂：
+
+1. **会话在插件装载之前就存在**（GUI 里恢复的历史会话、或 `agent/created` 早于插件 apply 的那一轮）。
+   只订阅 `agent/created` 永远补不上 → 现在在 `ctx.inject(['agents'], …)` 里先 `agents.list()` 全量补挂，
+   再订阅后续创建（插件声明 `inject = []`，服务没就绪时延迟装载，见 6 节踩坑）。
+2. **`subagent/start` 没落在被挂载的 scope 上**。`turn-stopping` 挂在 agent scope，但
+   `subagent/start` 是从父 agent 的 scope 派发的；一旦谁都没挂上，事件就没人收。
+   → 根上下文再订阅一份 `subagent/start`，用 `agents.list()` + `agents.isOwnedBy(childId, agent)` 反查父会话归属。
+
+`/state.agents` 就是这份「已挂载会话清单」（排障用）：徽标 0 时先看本会话在不在里面。
+另有一份结构化诊断快照落在 `<DSH_HOME>/storages/dsh-subagent-policy.diag.json`
+（`agents` / `counted`（含 `via: "owner" | "scoped"`）/ `turns` / `notes`，环形上限、写盘即刷），
+打包后的宿主拿不到 stdout 时靠它取证。
 
 ### 明确做不到
 
@@ -240,16 +265,19 @@ else ctx.inject(['webServer'], (scope) => registerRoutes(scope, scope.webServer)
 
 ```powershell
 cd F:\code\dsh插件\dsh-subagent-policy
-npm test          # 三件套：纯逻辑 + 宿主半 + 浏览器半
+npm test          # 36 单测 + 宿主冒烟 24 例 + 客户端冒烟 8 例
 ```
 
 - `test/policy.test.mjs`：语法解析/渲染/进度/提醒文案，10 组 `node:test`；
+- `test/counters.test.mjs`（13 组）：窗口结算、达标口径、`metInTurn`、修正次数上限，全部用**假时钟**驱动，不 sleep；
+- `test/store.test.mjs`（13 组）：原子写、非法条目过滤、`defaultSpec` 优先级、临时 `DSH_HOME`；
 - `scripts/smoke.mjs`：假 cordis 宿主跑真 `lib/index.js`——路由注册、跨站拒绝、per-agent section、
   `turn-stopping → steer`、计数去重、`maxCorrections` 上限、`tools.guard` 拦截、重复 apply 幂等、
-  无 webServer profile 的延迟挂载（假宿主同样复刻"读未声明属性即抛"的语义）；
+  晚加载会话补挂、`subagent/start` 归属兜底、无 webServer profile 的延迟挂载
+  （假宿主同样复刻"读未声明属性即抛"的语义）；
 - `scripts/client-smoke.mjs`：假 `window.__ModuleLoader__` + 最小 React 仿真跑真 `lib/client.js`——
   slot 注册（`conversation.input.left` / `subagent-policy.control`）、`hooks.subagentPolicy` 契约、
-  徽标与弹层渲染。
+  徽标与弹层渲染、客户端文案与宿主 `describeSpec` 防漂移、非法 spec 报错可见（曾经显示空白）。
 
 （Windows 上 `node --test` 必须显式给文件名，`node --test test\` 会 MODULE_NOT_FOUND。）
 
@@ -261,9 +289,18 @@ npm test          # 三件套：纯逻辑 + 宿主半 + 浏览器半
 ## 9. 文件
 
 ```
-lib/policy.js   纯逻辑：语法解析 / 渲染 / 进度判定 / 指令与提醒文案（无宿主依赖，可单测）
-lib/index.js    宿主半：状态持久化、per-agent prompt section、计数、turn-stopping 续命、tools.guard、REST
-lib/client.js   浏览器半：输入框徽标 + 设置弹层（免构建，只用 loader 给的 react）
+lib/index.js     装配层：幂等 apply、服务延迟装载、settle 定时器、管理面挂载（~150 行）
+lib/runtime.js   强制逻辑：per-agent section / turn-stopping 续命 / tools.guard / 计数归属
+lib/routes.js    管理面：三条 exact 路由 + 统一预检（loopback / method / body / sessionId）
+lib/counters.js  计数：达标口径 used、限流窗口 window、累计 total、修正次数（纯函数，注入 clock）
+lib/store.js     持久化：原子写、非法条目过滤、defaultSpec 优先级、诊断文件路径
+lib/settings.js  配置解析与常量（settleSeconds 边界、委派工具清单、section 名…）
+lib/message.js   注入消息构造（惰性 import @deepseek-ai/dsh-llm/message，失败退回等价对象）
+lib/http.js      HTTP 工具：loopback/同源校验、JSON 读写、体积上限
+lib/diag.js      结构化诊断快照（环形上限、写盘即刷）
+lib/debug.js     DSH_SUBPOLICY_DEBUG=<文件> 时追加文本事件（打包宿主唯一可观测通道）
+lib/policy.js    纯逻辑：语法解析 / 渲染 / 进度判定 / 指令与提醒文案（无宿主依赖，可单测）
+lib/client.js    浏览器半：输入框徽标 + 设置弹层（免构建，只用 loader 给的 react）
 cordis.patch.yml 插入行（bundle 路径用）
-test/ scripts/  单测与两半的冒烟
+test/ scripts/   单测与两半的冒烟
 ```

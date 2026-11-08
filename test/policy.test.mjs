@@ -127,5 +127,5 @@ test('提示词与拦截文案包含关键信息', () => {
   assert.match(reminder, /还差 2 次/)
 
   assert.equal(describeSpec(ok('2-4')), '2 到 4 个')
-  assert.equal(describeSpec(ok('any')), '至少 1 个（必须用子代理）')
+  assert.equal(describeSpec(ok('any')), '必须使用子代理（≥1）')
 })

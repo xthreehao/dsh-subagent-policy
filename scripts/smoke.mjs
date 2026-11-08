@@ -58,6 +58,15 @@ function createHost(options = {}) {
 
   const tools = { guard: (fn) => { guards.push(fn) } }
 
+  /** 既有 agent 列表（模拟「插件加载时已经存在的会话」，GUI 徽标 0 的修复点）。 */
+  const agentList = Array.isArray(options.agents) ? options.agents : []
+
+  const agents = {
+    list: () => agentList,
+    isOwnedBy: (id, agent) => options.ownerOf === undefined ? false : options.ownerOf(id, agent),
+    on: () => () => {},
+  }
+
   const webServer = {
     register(route) {
       if (routes.has(route.path)) throw new Error('duplicate exact route ' + route.path)
@@ -81,11 +90,11 @@ function createHost(options = {}) {
       get(service) {
         if (service === 'systemPrompt') return systemPrompt
         if (service === 'tools') return tools
-        if (service === 'agents') return { list: () => [] }
+        if (service === 'agents') return agents
         if (service === 'webServer') return webServerFor(scope)
         return undefined
       },
-      // cordis 的延迟装载：等服务就绪后回调（这里假定 webServer 立刻可用）。
+      // cordis 的延迟装载：等服务就绪后回调（这里假定服务立刻可用）。
       inject(deps, callback) {
         if (deps.includes('webServer')) {
           // 注入后的 scope 才允许属性访问（真实 cordis 语义）。
@@ -95,6 +104,16 @@ function createHost(options = {}) {
             on: scope.on,
             get: (service) => (service === 'webServer' ? webServer : scope.get(service)),
             webServer,
+          }
+          callback(injected)
+        }
+        if (deps.includes('agents')) {
+          const injected = {
+            logger: scope.logger,
+            effect: scope.effect,
+            on: scope.on,
+            get: (service) => (service === 'agents' ? agents : scope.get(service)),
+            agents,
           }
           callback(injected)
         }
@@ -121,6 +140,7 @@ function createHost(options = {}) {
   const ctx = makeCtx()
   const host = {
     ctx,
+    agents: agentList,
     routes,
     guards,
     systemPromptSections,
@@ -538,6 +558,31 @@ await check('回归：自己 steer 的消息不能被当成用户输入（否则
   const before = a.steered.length
   await a.emit('agent/turn-stopping', { turn: {}, signal: { aborted: false } })
   assert.equal(a.steered.length, before + 1, '真用户新消息应重新强制')
+})
+
+await check('晚加载：插件装载前就存在的会话会被补挂（徽标显示 0 的根因）', async () => {
+  const late = createHost()
+  const legacy = late.makeAgent('legacy-session')
+  late.agents.push(legacy)
+  plugin.apply(late.ctx, { defaultSpec: 'any' })
+  assert.ok(legacy.sections.has('subagent-policy:session'), '既有会话应被补挂 section')
+  const state = await call(late, API + '/state')
+  assert.ok(
+    state.json.agents.indexOf('legacy-session') >= 0,
+    '/state 应列出已挂载会话，实际：' + JSON.stringify(state.json.agents),
+  )
+})
+
+await check('归属兜底：根上下文收到 subagent/start 时按 ownership 记到父会话', async () => {
+  const w = createHost({ ownerOf: (childId, candidate) => candidate.id === 'owner-session' })
+  plugin.apply(w.ctx, { defaultSpec: 'any' })
+  const parent = w.makeAgent('owner-session')
+  w.agents.push(parent)
+  await w.emit('agent/created', { agent: parent })
+  await w.emit('subagent/start', { id: 'owned-child-1' })
+  const state = await call(w, API + '/state')
+  assert.equal(state.json.used['owner-session'], 1, '应把子代理记到父会话头上')
+  assert.equal(state.json.counts['owner-session'], 1, '窗口计数同样要记上')
 })
 
 await check('无 webServer 的 profile：延迟装载后仍挂上管理面路由', () => {

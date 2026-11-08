@@ -225,6 +225,61 @@ await check('点开徽标渲染弹层（预设 + 自定义输入）', () => {
   assert.ok(String(popover.children.map(textOf).join(' ')).indexOf('常用') >= 0, '弹层应有预设分组标题')
 })
 
+await check('文案漂移：客户端 describe 与宿主 describeSpec 说法一致', async () => {
+  const policy = await import('../lib/policy.js')
+  for (const spec of ['off', 'any', '=3', '>2', '>=2', '<4', '<=4', '2-4']) {
+    const parsed = policy.parseSpec(spec)
+    assert.equal(parsed.ok, true, spec + ' 应能解析')
+    assert.equal(
+      exportsObject.__describe(spec),
+      policy.describeSpec(parsed.spec),
+      '客户端与宿主的文案漂移：' + spec,
+    )
+  }
+})
+
+await check('非法 spec 的报错能显示出来（回归：曾经只显示空白）', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 400,
+    json: async () => ({
+      ok: false,
+      error: 'unrecognized',
+      errorCode: 'unrecognized',
+      message: '约束写法无法识别，例如 2、>=2、<4、2-4、any 或 off',
+    }),
+  })
+  try {
+    const liveSource = { getSnapshot: () => ({ spec: 'off', count: 0 }), subscribe: () => () => {} }
+    let tree = renderComponent(registration.component, liveSource)
+    if (findByType(tree, 'input') === undefined) {
+      tree.props.onClick()
+      tree = renderComponent(registration.component, liveSource)
+    }
+    const input = findByType(tree, 'input')
+    assert.ok(input !== undefined, '应有输入框')
+    input.props.onChange({ target: { value: 'zzz' } })
+    tree = renderComponent(registration.component, liveSource)
+    const buttons = []
+    const collect = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object') return
+      if (Array.isArray(node)) { node.forEach(collect); return }
+      if (node.type === 'button') buttons.push(node)
+      collect(node.children)
+    }
+    collect(tree)
+    const applyButton = buttons.find((node) => textOf(node).indexOf('应用') >= 0)
+    assert.ok(applyButton !== undefined, '应有应用按钮')
+    applyButton.props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    const text = textOf(renderComponent(registration.component, liveSource))
+    assert.ok(text.indexOf('约束写法无法识别') >= 0, '应显示出服务端报错文案，实际：' + text)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 function renderComponent(component, source) {
   React.__resetCursor()
   return component({
