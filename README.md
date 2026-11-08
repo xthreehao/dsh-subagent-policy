@@ -200,6 +200,11 @@ v0.2.1 拆成两套，各管一件事：
 基础层是 `subagent` / `subagent_fork` / `workflow`，Teams 层（`@deepseek-ai/dsh-experimental-agent-team-profile`）
 会换成 `spawn_teammate` 等，所以做成可配置集合而不是写死。
 
+> ⚠️ **`defaultSpec` 默认写成 `'off'` 会导致「换个新对话就不强制了」**——每个新会话都是独立策略，
+> 默认值是 `off` 时模型不会派子代理。想要「默认就必须用子代理、个别会话再放宽」，把它设成 `'any'`（或 `'>=2'`）。
+> `defaultSpec` 只在 config 里生效一次（config 显式写了就永远优先于状态文件）。
+> 注意改 config **要重启宿主**；改单个会话的策略点徽标即可，立即生效。
+
 没有浏览器半的 profile（`headless`、`tui`）里插件照样强制：此时没有输入框徽标，
 策略靠 `defaultSpec` 定；例如 `dsh --profile headless --patch .\sandbox\patch-headless.yml "run the tests"`，
 patch 里写 `config: { defaultSpec: '=2' }`。注意插件包是**按 profile 目录**解析的，
